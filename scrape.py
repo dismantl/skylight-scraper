@@ -7,6 +7,7 @@ def main():
     parser.add_argument('-f', '--frame', required=True, type=int, help='Numeric ID of the frame to download from')
     parser.add_argument('-a', '--auth', required=True, help='Base64 string from Authorization header')
     parser.add_argument('-o', '--output', required=True, help='Directory to download photos to')
+    parser.add_argument('-s', '--senders', help='Only download photos sent by these email addresses (comma separated)')
     args = parser.parse_args()
     
     photos = []
@@ -33,6 +34,8 @@ def main():
 
     files = [f for f in os.listdir(args.output) if os.path.isfile(os.path.join(args.output, f))]
     for photo in photos:
+        if args.senders and photo['from'] not in args.senders.split(','):
+            continue
         filename = f"{photo['timestamp']}_{photo['from']}_{photo['key']}"
         if filename not in files:
             destination = os.path.join(args.output, filename)
