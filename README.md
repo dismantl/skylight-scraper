@@ -1,34 +1,91 @@
 # Skylight Scraper
 
-Skylight Scraper is a small Python 3 script that syncs photos from a Skylight digital picture frame to a local directory. This can be useful for backing up your photos or for mirroring your Skylight photo albums to another platform. Personally, I wrote it to mirror my Skylight photos to my Nextcloud server, giving me a way to share my photos with people without Skylight frames.
+Skylight Scraper synchronizes photos and videos from a Skylight digital picture
+frame to a local directory. The output can be backed up or mirrored to another
+photo service.
+
+Skylight does not publish the API used by this project. The scraper can stop
+working when Skylight changes its web application or private API.
+
+## Requirements
+
+- [uv](https://docs.astral.sh/uv/)
+- A Skylight account with access to the frame
 
 ## Setup
 
+```console
+git clone https://github.com/dismantl/skylight-scraper.git
+cd skylight-scraper
+uv sync
 ```
-$ git clone https://acab.enterprises/dismantl/skylight-scraper.git
-$ cd skylight-scraper
-$ pip install -r requirements.txt
+
+## Authentication
+
+The scraper uses the Bearer authorization value from a logged-in Skylight
+Desktop App session. It does not accept the authorization value as a command-line
+argument because command-line secrets can be exposed through shell history and
+process listings.
+
+1. Log in at <https://ourskylight.com/>.
+2. Open the browser developer tools and select the **Network** panel.
+3. Select the frame and find a request whose path contains
+   `/api/frames/<FRAME_ID>/messages`.
+4. Copy the complete `Authorization` request-header value. It starts with
+   `Bearer`.
+5. Save that value in a file readable only by your user:
+
+   ```console
+   chmod 600 /path/to/skylight-authorization
+   ```
+
+The numeric frame ID is also present in that request path. Treat the
+authorization value like a password and remove or replace the file if it is no
+longer needed.
+
+The `SKYLIGHT_AUTHORIZATION` environment variable can be used instead of an
+authorization file. Avoid placing its value directly in shell history.
+
+## Usage
+
+```console
+uv run skylight-scraper \
+  --frame 1234567 \
+  --auth-file /path/to/skylight-authorization \
+  --output /path/to/media
 ```
 
-## Running
+To download media only from specific senders, provide a comma-separated list:
 
-In order to run the script, you'll need two pieces of data. The first is the numeric ID of the picture frame you want to download photos from. This is in the URL when you view the frame on the Skylight website, e.g. `https://app.ourskylight.com/frames/<FRAME_ID>/messages`. The second piece of data you'll need is your authorization string. This can be found by going to the Skylight website and logging in, and then viewing any of the AJAX requests for the `Authorization` header. The screenshot below shows how to find this string in Chrome developer tools; the string you want is base64-encoded and don't include the `Basic` prefix.
-
-![screenshot](./img/auth.png)
-
-Once you have those pieces of data, you can start syncing photos from that frame to a local directory:
-
+```console
+uv run skylight-scraper \
+  --frame 1234567 \
+  --auth-file /path/to/skylight-authorization \
+  --output /path/to/media \
+  --senders first@example.com,second@example.com
 ```
-$ python3 scraper.py -h
-usage: Skylight Scraper [-h] -f FRAME -a AUTH -o OUTPUT
 
-Syncs photos from a Skylight frame to a local directory
+Existing destination files are skipped. New files retain the original naming
+scheme:
 
-optional arguments:
-  -h, --help            show this help message and exit
-  -f FRAME, --frame FRAME
-                        Numeric ID of the frame to download from
-  -a AUTH, --auth AUTH  Base64 string from Authorization header
-  -o OUTPUT, --output OUTPUT
-                        Directory to download photos to
+```text
+<CREATED_AT>_<SENDER>_<ASSET_KEY>
+```
+
+Downloads are streamed to temporary files in the output directory and renamed
+atomically after completion. Incomplete temporary files are removed after a
+failed download.
+
+## Development
+
+Run the tests:
+
+```console
+uv run pytest
+```
+
+Build the package:
+
+```console
+uv build
 ```
