@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
+from uuid import NAMESPACE_URL, uuid5
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -14,6 +15,9 @@ from urllib3.util.retry import Retry
 API_ROOT = "https://app.ourskylight.com/api"
 WEB_ROOT = "https://app.ourskylight.com"
 DEFAULT_TIMEOUT = (5, 60)
+OAUTH_CLIENT_ID = "skylight-mobile"
+OAUTH_REDIRECT_URI = "https://ourskylight.com/welcome"
+OAUTH_SCOPE = "everything"
 
 
 class SkylightError(RuntimeError):
@@ -52,7 +56,8 @@ def build_login_session(
     timeout: tuple[int, int] = DEFAULT_TIMEOUT,
 ) -> requests.Session:
     session = session or _retrying_session()
-    login_url = urljoin(f"{web_root.rstrip('/')}/", "auth/session")
+    web_root = web_root.rstrip("/")
+    login_url = f"{web_root}/auth/session"
     try:
         form = session.get(f"{login_url}/new", timeout=timeout)
         form.raise_for_status()
@@ -67,22 +72,103 @@ def build_login_session(
                 "email": email,
                 "password": password,
             },
+            headers={
+                "Origin": web_root,
+                "Referer": f"{login_url}/new",
+            },
             allow_redirects=False,
             timeout=timeout,
         )
-    except ProtocolError:
-        raise
-    except requests.RequestException as exc:
-        raise SkylightError("failed to authenticate with Skylight") from exc
+        login_target = urlparse(
+            urljoin(response.url, response.headers.get("Location", ""))
+        )
+        if not 300 <= response.status_code < 400 or (
+            login_target.path != "/auth/session/success"
+        ):
+            raise AuthenticationError("Skylight login was rejected")
 
-    if not 300 <= response.status_code < 400 or not response.headers.get("Location"):
-        if response.status_code >= 500:
-            try:
-                response.raise_for_status()
-            except requests.RequestException as exc:
-                raise SkylightError("failed to authenticate with Skylight") from exc
-        raise AuthenticationError("Skylight login was rejected")
+        authorization_code = _request_authorization_code(
+            session,
+            web_root,
+            timeout,
+        )
+        token_response = session.post(
+            f"{web_root}/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "client_id": OAUTH_CLIENT_ID,
+                "scope": OAUTH_SCOPE,
+                "redirect_uri": OAUTH_REDIRECT_URI,
+                "code": authorization_code,
+                "skylight_api_client_device_fingerprint": str(
+                    uuid5(NAMESPACE_URL, f"skylight-scraper:{email.casefold()}")
+                ),
+                "skylight_api_client_device_platform": "web",
+                "skylight_api_client_device_name": "skylight-scraper",
+                "skylight_api_client_device_os_version": "unknown",
+                "skylight_api_client_device_app_version": "unknown",
+                "skylight_api_client_device_hardware": "unknown",
+                "source": "js-mobile",
+            },
+            headers={"Accept": "application/json"},
+            timeout=timeout,
+        )
+        if token_response.status_code in {400, 401, 403, 422}:
+            raise AuthenticationError("Skylight token exchange was rejected")
+        token_response.raise_for_status()
+        token_body = token_response.json()
+        if not isinstance(token_body, dict):
+            raise ProtocolError("Skylight token response is not an object")
+        access_token = token_body.get("access_token")
+        token_type = token_body.get("token_type")
+        if not isinstance(access_token, str) or not access_token:
+            raise ProtocolError("Skylight token response is missing an access token")
+        if not isinstance(token_type, str) or token_type.casefold() != "bearer":
+            raise ProtocolError("Skylight token response has an invalid token type")
+        session.headers.update({"Authorization": f"Bearer {access_token}"})
+    except (AuthenticationError, ProtocolError):
+        raise
+    except (requests.RequestException, ValueError) as exc:
+        raise SkylightError("failed to authenticate with Skylight") from exc
     return session
+
+
+def _request_authorization_code(
+    session: requests.Session,
+    web_root: str,
+    timeout: tuple[int, int],
+) -> str:
+    authorize_url = f"{web_root}/oauth/authorize"
+    authorize_params = {
+        "client_id": OAUTH_CLIENT_ID,
+        "response_type": "code",
+        "scope": OAUTH_SCOPE,
+        "redirect_uri": OAUTH_REDIRECT_URI,
+    }
+    next_url = f"{authorize_url}?{urlencode(authorize_params)}"
+    expected_origin = urlparse(web_root)
+
+    for _ in range(4):
+        response = session.get(
+            next_url,
+            allow_redirects=False,
+            timeout=timeout,
+        )
+        location = response.headers.get("Location")
+        if not 300 <= response.status_code < 400 or not location:
+            raise ProtocolError("Skylight authorization did not redirect")
+        target = urlparse(urljoin(response.url, location))
+        code = parse_qs(target.query).get("code", [None])[0]
+        if code:
+            return code
+        if (target.scheme, target.netloc) != (
+            expected_origin.scheme,
+            expected_origin.netloc,
+        ):
+            raise ProtocolError("Skylight authorization redirected unexpectedly")
+        next_url = target.geturl()
+
+    raise ProtocolError("Skylight authorization code was not returned")
 
 
 def build_media_session() -> requests.Session:

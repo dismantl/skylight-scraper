@@ -53,11 +53,12 @@ def page(number, total, items):
 
 
 class StubResponse:
-    def __init__(self, status_code, body, *, text="", headers=None):
+    def __init__(self, status_code, body, *, text="", headers=None, url=""):
         self.status_code = status_code
         self._body = body
         self.text = text
         self.headers = headers or {}
+        self.url = url
 
     def json(self):
         return self._body
@@ -75,11 +76,15 @@ class StubSession:
 
     def get(self, url, **kwargs):
         self.requests.append(("GET", url, kwargs))
-        return self.responses.popleft()
+        response = self.responses.popleft()
+        response.url = response.url or url
+        return response
 
     def post(self, url, **kwargs):
         self.requests.append(("POST", url, kwargs))
-        return self.responses.popleft()
+        response = self.responses.popleft()
+        response.url = response.url or url
+        return response
 
 
 def test_build_login_session_posts_csrf_protected_credentials():
@@ -91,7 +96,27 @@ def test_build_login_session_posts_csrf_protected_credentials():
     session = StubSession(
         [
             StubResponse(200, None, text=login_form),
-            StubResponse(302, None, headers={"Location": "/frames"}),
+            StubResponse(
+                302,
+                None,
+                headers={"Location": "/auth/session/success"},
+            ),
+            StubResponse(
+                302,
+                None,
+                headers={
+                    "Location": "https://ourskylight.com/welcome?code=example-code"
+                },
+            ),
+            StubResponse(
+                200,
+                {
+                    "access_token": "example-access-token",
+                    "token_type": "Bearer",
+                    "expires_in": 86400,
+                    "refresh_token": "unused-refresh-token",
+                },
+            ),
         ]
     )
 
@@ -102,26 +127,38 @@ def test_build_login_session_posts_csrf_protected_credentials():
     )
 
     assert result is session
-    assert session.requests == [
+    assert session.headers["Authorization"] == "Bearer example-access-token"
+    assert [request[:2] for request in session.requests] == [
+        ("GET", "https://app.ourskylight.com/auth/session/new"),
+        ("POST", "https://app.ourskylight.com/auth/session"),
         (
             "GET",
-            "https://app.ourskylight.com/auth/session/new",
-            {"timeout": (5, 60)},
+            (
+                "https://app.ourskylight.com/oauth/authorize"
+                "?client_id=skylight-mobile&response_type=code&scope=everything&"
+                "redirect_uri=https%3A%2F%2Fourskylight.com%2Fwelcome"
+            ),
         ),
-        (
-            "POST",
-            "https://app.ourskylight.com/auth/session",
-            {
-                "data": {
-                    "authenticity_token": "csrf-token",
-                    "email": "person@example.com",
-                    "password": "example-password",
-                },
-                "allow_redirects": False,
-                "timeout": (5, 60),
-            },
-        ),
+        ("POST", "https://app.ourskylight.com/oauth/token"),
     ]
+    login_request = session.requests[1][2]
+    assert login_request["data"] == {
+        "authenticity_token": "csrf-token",
+        "email": "person@example.com",
+        "password": "example-password",
+    }
+    assert login_request["headers"] == {
+        "Origin": "https://app.ourskylight.com",
+        "Referer": "https://app.ourskylight.com/auth/session/new",
+    }
+    assert login_request["allow_redirects"] is False
+    token_request = session.requests[3][2]
+    assert token_request["data"]["grant_type"] == "authorization_code"
+    assert token_request["data"]["client_id"] == "skylight-mobile"
+    assert token_request["data"]["code"] == "example-code"
+    assert token_request["data"]["skylight_api_client_device_name"] == (
+        "skylight-scraper"
+    )
 
 
 def test_build_login_session_rejects_invalid_credentials_without_response_body():
@@ -144,6 +181,63 @@ def test_build_login_session_rejects_invalid_credentials_without_response_body()
         )
 
     assert "private detail" not in str(exc.value)
+
+
+def test_build_login_session_rejects_missing_authorization_code():
+    session = StubSession(
+        [
+            StubResponse(
+                200,
+                None,
+                text='<input name="authenticity_token" value="csrf-token">',
+            ),
+            StubResponse(
+                302,
+                None,
+                headers={"Location": "/auth/session/success"},
+            ),
+            StubResponse(200, None),
+        ]
+    )
+
+    with pytest.raises(ProtocolError, match="did not redirect"):
+        build_login_session(
+            "person@example.com",
+            "example-password",
+            session=session,
+        )
+
+
+def test_build_login_session_rejects_token_response_without_access_token():
+    session = StubSession(
+        [
+            StubResponse(
+                200,
+                None,
+                text='<input name="authenticity_token" value="csrf-token">',
+            ),
+            StubResponse(
+                302,
+                None,
+                headers={"Location": "/auth/session/success"},
+            ),
+            StubResponse(
+                302,
+                None,
+                headers={
+                    "Location": "https://ourskylight.com/welcome?code=example-code"
+                },
+            ),
+            StubResponse(200, {"token_type": "Bearer"}),
+        ]
+    )
+
+    with pytest.raises(ProtocolError, match="missing an access token"):
+        build_login_session(
+            "person@example.com",
+            "example-password",
+            session=session,
+        )
 
 
 def test_build_login_session_requires_csrf_token():

@@ -29,9 +29,10 @@ in separate files readable only by your user:
 chmod 600 /path/to/skylight-email /path/to/skylight-password
 ```
 
-The scraper signs in through Skylight's web login at the start of each run and
-keeps the resulting session cookie in memory. The credentials and cookie are
-never placed in command-line arguments or written to disk.
+The scraper signs in through Skylight's web login at the start of each run,
+completes the authorization-code exchange, and keeps the resulting Bearer token
+in memory. The credentials and token are never placed in command-line arguments
+or written to disk.
 
 `SKYLIGHT_EMAIL` and `SKYLIGHT_PASSWORD` can be used instead of files. Avoid
 placing their values directly in shell history.
