@@ -2,14 +2,17 @@ import os
 import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 API_ROOT = "https://app.ourskylight.com/api"
+WEB_ROOT = "https://app.ourskylight.com"
 DEFAULT_TIMEOUT = (5, 60)
 
 
@@ -40,6 +43,48 @@ def build_session(authorization: str) -> requests.Session:
     return session
 
 
+def build_login_session(
+    email: str,
+    password: str,
+    *,
+    session: requests.Session | None = None,
+    web_root: str = WEB_ROOT,
+    timeout: tuple[int, int] = DEFAULT_TIMEOUT,
+) -> requests.Session:
+    session = session or _retrying_session()
+    login_url = urljoin(f"{web_root.rstrip('/')}/", "auth/session")
+    try:
+        form = session.get(f"{login_url}/new", timeout=timeout)
+        form.raise_for_status()
+        parser = _AuthenticityTokenParser()
+        parser.feed(form.text)
+        if parser.token is None:
+            raise ProtocolError("Skylight login form is missing its security token")
+        response = session.post(
+            login_url,
+            data={
+                "authenticity_token": parser.token,
+                "email": email,
+                "password": password,
+            },
+            allow_redirects=False,
+            timeout=timeout,
+        )
+    except ProtocolError:
+        raise
+    except requests.RequestException as exc:
+        raise SkylightError("failed to authenticate with Skylight") from exc
+
+    if not 300 <= response.status_code < 400 or not response.headers.get("Location"):
+        if response.status_code >= 500:
+            try:
+                response.raise_for_status()
+            except requests.RequestException as exc:
+                raise SkylightError("failed to authenticate with Skylight") from exc
+        raise AuthenticationError("Skylight login was rejected")
+    return session
+
+
 def build_media_session() -> requests.Session:
     return _retrying_session()
 
@@ -59,11 +104,28 @@ def _retrying_session() -> requests.Session:
     return session
 
 
+class _AuthenticityTokenParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.token: str | None = None
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        if tag != "input":
+            return
+        attributes = dict(attrs)
+        if attributes.get("name") == "authenticity_token":
+            self.token = attributes.get("value")
+
+
 class SkylightClient:
     def __init__(
         self,
         frame_id: int,
-        authorization: str,
+        authorization: str | None = None,
         *,
         session: requests.Session | None = None,
         media_session: requests.Session | None = None,
@@ -71,9 +133,12 @@ class SkylightClient:
         timeout: tuple[int, int] = DEFAULT_TIMEOUT,
     ):
         self.frame_id = frame_id
-        self.session = session or build_session(authorization)
+        if session is None and authorization is None:
+            raise ValueError("authorization or an authenticated session is required")
+        self.session = session or build_session(authorization or "")
         self.media_session = media_session or build_media_session()
-        self.session.headers.update({"Authorization": authorization})
+        if authorization is not None:
+            self.session.headers.update({"Authorization": authorization})
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 

@@ -9,6 +9,7 @@ from skylight_scraper.client import (
     ProtocolError,
     SkylightClient,
     SkylightError,
+    build_login_session,
     build_media_session,
     build_session,
 )
@@ -52,9 +53,11 @@ def page(number, total, items):
 
 
 class StubResponse:
-    def __init__(self, status_code, body):
+    def __init__(self, status_code, body, *, text="", headers=None):
         self.status_code = status_code
         self._body = body
+        self.text = text
+        self.headers = headers or {}
 
     def json(self):
         return self._body
@@ -71,8 +74,87 @@ class StubSession:
         self.requests = []
 
     def get(self, url, **kwargs):
-        self.requests.append((url, kwargs))
+        self.requests.append(("GET", url, kwargs))
         return self.responses.popleft()
+
+    def post(self, url, **kwargs):
+        self.requests.append(("POST", url, kwargs))
+        return self.responses.popleft()
+
+
+def test_build_login_session_posts_csrf_protected_credentials():
+    login_form = """
+    <form action="/auth/session" method="post">
+      <input type="hidden" name="authenticity_token" value="csrf-token">
+    </form>
+    """
+    session = StubSession(
+        [
+            StubResponse(200, None, text=login_form),
+            StubResponse(302, None, headers={"Location": "/frames"}),
+        ]
+    )
+
+    result = build_login_session(
+        "person@example.com",
+        "example-password",
+        session=session,
+    )
+
+    assert result is session
+    assert session.requests == [
+        (
+            "GET",
+            "https://app.ourskylight.com/auth/session/new",
+            {"timeout": (5, 60)},
+        ),
+        (
+            "POST",
+            "https://app.ourskylight.com/auth/session",
+            {
+                "data": {
+                    "authenticity_token": "csrf-token",
+                    "email": "person@example.com",
+                    "password": "example-password",
+                },
+                "allow_redirects": False,
+                "timeout": (5, 60),
+            },
+        ),
+    ]
+
+
+def test_build_login_session_rejects_invalid_credentials_without_response_body():
+    session = StubSession(
+        [
+            StubResponse(
+                200,
+                None,
+                text='<input name="authenticity_token" value="csrf-token">',
+            ),
+            StubResponse(422, {"password": "private detail"}),
+        ]
+    )
+
+    with pytest.raises(AuthenticationError, match="login was rejected") as exc:
+        build_login_session(
+            "person@example.com",
+            "wrong-password",
+            session=session,
+        )
+
+    assert "private detail" not in str(exc.value)
+
+
+def test_build_login_session_requires_csrf_token():
+    session = StubSession([StubResponse(200, None, text="<form></form>")])
+
+    with pytest.raises(ProtocolError, match="security token"):
+        build_login_session(
+            "person@example.com",
+            "example-password",
+            session=session,
+        )
 
 
 def test_iterates_assets_page_by_page():
@@ -88,7 +170,7 @@ def test_iterates_assets_page_by_page():
 
     assert [item.asset_key for item in assets] == ["photo.jpg", "video.mp4"]
     assert [item.asset_type for item in assets] == ["photo", "video"]
-    assert [request[1]["params"] for request in session.requests] == [
+    assert [request[2]["params"] for request in session.requests] == [
         {"page": 1},
         {"page": 2},
     ]
@@ -159,7 +241,7 @@ def test_downloads_media_atomically_without_account_authorization(tmp_path):
     assert destination.read_bytes() == b"firstsecond"
     assert not list(tmp_path.glob("*.part"))
     assert "Authorization" not in media_session.headers
-    assert media_session.requests[0][1]["stream"] is True
+    assert media_session.requests[0][2]["stream"] is True
     assert response.closed is True
 
 

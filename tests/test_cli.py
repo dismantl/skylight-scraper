@@ -77,6 +77,57 @@ def test_main_uses_authorization_environment_variable(tmp_path, monkeypatch):
     assert observed["authorization"] == "Bearer environment-token"
 
 
+def test_main_logs_in_with_private_credential_files(tmp_path, monkeypatch):
+    email_file = tmp_path / "email"
+    password_file = tmp_path / "password"
+    email_file.write_text("person@example.com\n")
+    password_file.write_text("example-password\n")
+    email_file.chmod(0o400)
+    password_file.chmod(0o400)
+    observed = {}
+    authenticated_session = object()
+
+    def stub_login(email, password):
+        observed["email"] = email
+        observed["password"] = password
+        return authenticated_session
+
+    class StubClient:
+        def __init__(self, frame_id, *, session):
+            observed["frame_id"] = frame_id
+            observed["session"] = session
+
+    monkeypatch.setattr(cli, "build_login_session", stub_login)
+    monkeypatch.setattr(cli, "SkylightClient", StubClient)
+    monkeypatch.setattr(
+        cli,
+        "sync_frame",
+        lambda client, output, *, senders: SyncResult(0, 0, 0, 0),
+    )
+
+    result = cli.main(
+        [
+            "--frame",
+            "42",
+            "--email-file",
+            str(email_file),
+            "--password-file",
+            str(password_file),
+            "--output",
+            str(tmp_path),
+        ],
+        environ={},
+    )
+
+    assert result == 0
+    assert observed == {
+        "email": "person@example.com",
+        "password": "example-password",
+        "frame_id": 42,
+        "session": authenticated_session,
+    }
+
+
 def test_main_reports_api_errors_without_traceback(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(cli, "SkylightClient", lambda frame_id, authorization: object())
 
@@ -103,5 +154,7 @@ def test_help_exposes_safe_authorization_inputs(capsys):
 
     help_text = capsys.readouterr().out
     assert "--auth-file" in help_text
+    assert "--email-file" in help_text
+    assert "--password-file" in help_text
     assert "SKYLIGHT_AUTHORIZATION" in help_text
     assert "-a AUTH" not in help_text
